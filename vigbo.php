@@ -8,12 +8,13 @@ function h($value)
 
 $defaultUrl = 'https://valeriashukh.gallery.photo/';
 $inputUrl = isset($_GET['url']) ? trim($_GET['url']) : $defaultUrl;
+$inputSlugs = isset($_GET['slugs']) ? trim($_GET['slugs']) : '';
 $shouldSearch = isset($_GET['url']);
 $result = null;
 
 if ($shouldSearch) {
     $finder = new VigboGalleryFinder();
-    $result = $finder->find($inputUrl);
+    $result = $finder->find($inputUrl, $inputSlugs);
 }
 ?>
 <!doctype html>
@@ -37,10 +38,14 @@ if ($shouldSearch) {
             border-radius: 8px;
             background: #fafafa;
         }
-        input[type="url"], input[type="text"] {
+        input[type="url"], input[type="text"], textarea {
             width: min(720px, 100%);
             padding: 10px;
             font-size: 16px;
+            box-sizing: border-box;
+        }
+        textarea {
+            min-height: 90px;
         }
         button {
             padding: 10px 16px;
@@ -85,13 +90,20 @@ if ($shouldSearch) {
             <li>Разбор Next.js/RSC payload: Vigbo публикует список в компоненте <code>PortfolioPageClient</code> как массив <code>galleries</code>.</li>
             <li>Проверка <code>robots.txt</code> и стандартных sitemap-файлов, где могут быть URL вида <code>/gallery/&lt;slug&gt;/</code>.</li>
             <li>Сбор ссылок и путей <code>/gallery/&lt;slug&gt;</code> из HTML с валидацией на том же домене, чтобы отсечь служебные чужие ссылки из шаблона Vigbo.</li>
+            <li>Безопасная часть метода из 2ch: для обычного сайта фотографа проверяется производный домен <code>имя-сайта.gallery.photo</code>, а вручную заданные slug'и проверяются как <code>/gallery/&lt;slug&gt;/</code>.</li>
         </ol>
+        <p class="muted">Обход пароля и API-скачивание закрытых галерей намеренно не реализованы.</p>
     </div>
 
     <form method="get" action="vigbo.php">
         <p>
-            <label for="url">Сайт Vigbo/gallery.photo</label><br>
+            <label for="url">Сайт фотографа или Vigbo/gallery.photo</label><br>
             <input id="url" type="url" name="url" value="<?=h($inputUrl)?>" placeholder="https://example.gallery.photo/">
+        </p>
+        <p>
+            <label for="slugs">Slug-кандидаты, по одному на строку или через запятую</label><br>
+            <textarea id="slugs" name="slugs" placeholder="anna&#10;2024-05-10&#10;ivan-i-maria"><?=h($inputSlugs)?></textarea>
+            <br><span class="muted">Это ручная проверка формата из тредов: <code>/gallery/&lt;slug&gt;/</code>. Максимум 40 кандидатов за запуск.</span>
         </p>
         <button type="submit">Найти галереи</button>
     </form>
@@ -99,6 +111,9 @@ if ($shouldSearch) {
     <?php if ($result !== null): ?>
         <div class="card">
             <h2>Результат для <?=h($result['baseUrl'])?></h2>
+            <?php if (!empty($result['searchBaseUrls'])): ?>
+                <p class="muted">Проверенные базы: <?=h(implode(', ', $result['searchBaseUrls']))?></p>
+            <?php endif; ?>
 
             <?php if (!empty($result['errors'])): ?>
                 <div class="errors">

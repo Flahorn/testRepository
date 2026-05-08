@@ -13,22 +13,25 @@ class VigboGalleryFinder
         $this->userAgent = 'Mozilla/5.0 (compatible; VigboGalleryFinder/1.0)';
     }
 
-    public function find($inputUrl)
+    public function find($inputUrl, $manualSlugs = [])
     {
         $baseUrl = $this->normalizeBaseUrl($inputUrl);
         if ($baseUrl === null) {
             return [
                 'baseUrl' => '',
                 'host' => '',
+                'searchBaseUrls' => [],
                 'methods' => [],
                 'errors' => ['Укажите корректный URL сайта Vigbo/gallery.photo.'],
                 'galleries' => [],
             ];
         }
 
+        $searchBaseUrls = $this->candidateBaseUrls($baseUrl);
         $result = [
             'baseUrl' => $baseUrl,
             'host' => parse_url($baseUrl, PHP_URL_HOST),
+            'searchBaseUrls' => $searchBaseUrls,
             'methods' => [],
             'errors' => [],
             'galleries' => [],
@@ -36,38 +39,49 @@ class VigboGalleryFinder
 
         $candidates = [];
 
-        $home = $this->fetchUrl($baseUrl);
-        $result['methods'][] = $this->methodStatus('Главная страница', $baseUrl, $home);
-        if ($home['ok']) {
-            $this->mergeCandidates(
-                $candidates,
-                $this->extractPortfolioGalleries($home['body'], $baseUrl, 'Next.js/RSC galleries')
-            );
-            $this->mergeCandidates(
-                $candidates,
-                $this->extractLinkedGalleryPaths($home['body'], $baseUrl, 'Ссылки на главной', true)
-            );
-            $this->mergeCandidates(
-                $candidates,
-                $this->extractLinkedGalleryPaths($home['body'], $baseUrl, 'HTML /gallery/<slug>', false)
-            );
-        }
-
-        $sitemapUrls = $this->discoverSitemaps($baseUrl, $result);
-        foreach ($sitemapUrls as $sitemapUrl) {
-            $sitemap = $this->fetchUrl($sitemapUrl);
-            $result['methods'][] = $this->methodStatus('Sitemap', $sitemapUrl, $sitemap);
-            if (!$sitemap['ok']) {
-                continue;
+        foreach ($searchBaseUrls as $searchBaseUrl) {
+            $home = $this->fetchUrl($searchBaseUrl);
+            $result['methods'][] = $this->methodStatus('Главная страница', $searchBaseUrl, $home);
+            if ($home['ok']) {
+                $this->mergeCandidates(
+                    $candidates,
+                    $this->extractPortfolioGalleries($home['body'], $searchBaseUrl, 'Next.js/RSC galleries')
+                );
+                $this->mergeCandidates(
+                    $candidates,
+                    $this->extractLinkedGalleryPaths($home['body'], $searchBaseUrl, 'Ссылки на главной', true)
+                );
+                $this->mergeCandidates(
+                    $candidates,
+                    $this->extractManualSlugCandidates($manualSlugs, $searchBaseUrl)
+                );
+                $this->mergeCandidates(
+                    $candidates,
+                    $this->extractLinkedGalleryPaths($home['body'], $searchBaseUrl, 'HTML /gallery/<slug>', false)
+                );
+            } else {
+                $this->mergeCandidates(
+                    $candidates,
+                    $this->extractManualSlugCandidates($manualSlugs, $searchBaseUrl)
+                );
             }
 
-            $this->mergeCandidates(
-                $candidates,
-                $this->extractSitemapGalleries($sitemap['body'], $baseUrl)
-            );
+            $sitemapUrls = $this->discoverSitemaps($searchBaseUrl, $result);
+            foreach ($sitemapUrls as $sitemapUrl) {
+                $sitemap = $this->fetchUrl($sitemapUrl);
+                $result['methods'][] = $this->methodStatus('Sitemap', $sitemapUrl, $sitemap);
+                if (!$sitemap['ok']) {
+                    continue;
+                }
+
+                $this->mergeCandidates(
+                    $candidates,
+                    $this->extractSitemapGalleries($sitemap['body'], $searchBaseUrl)
+                );
+            }
         }
 
-        $result['galleries'] = $this->validateCandidates($candidates, $baseUrl);
+        $result['galleries'] = $this->validateCandidates($candidates);
 
         usort($result['galleries'], function ($a, $b) {
             $titleA = function_exists('mb_strtolower') ? mb_strtolower($a['title']) : strtolower($a['title']);
@@ -76,6 +90,84 @@ class VigboGalleryFinder
         });
 
         return $result;
+    }
+
+    private function candidateBaseUrls($baseUrl)
+    {
+        $baseUrls = [$baseUrl];
+        $host = parse_url($baseUrl, PHP_URL_HOST);
+        if (!is_string($host) || $host === '') {
+            return $baseUrls;
+        }
+
+        $host = preg_replace('~^www\.~i', '', strtolower($host));
+        if (substr($host, -strlen('.gallery.photo')) === '.gallery.photo') {
+            return $baseUrls;
+        }
+
+        $parts = explode('.', $host);
+        if (count($parts) < 2 || $parts[0] === '') {
+            return $baseUrls;
+        }
+
+        // 2ch threads describe this common Vigbo convention:
+        // photographer-site.ru -> photographer-site.gallery.photo.
+        $derivedBaseUrl = 'https://' . $parts[0] . '.gallery.photo/';
+        if (!in_array($derivedBaseUrl, $baseUrls, true)) {
+            $baseUrls[] = $derivedBaseUrl;
+        }
+
+        return $baseUrls;
+    }
+
+    private function extractManualSlugCandidates($manualSlugs, $baseUrl)
+    {
+        $found = [];
+        foreach ($this->normalizeManualSlugs($manualSlugs) as $slug) {
+            $url = $this->galleryUrlFromSlug($baseUrl, $slug);
+            if ($url === null) {
+                continue;
+            }
+
+            $found[] = [
+                'url' => $url,
+                'title' => '',
+                'source' => 'Ручной slug (2ch-подход)',
+                'confidence' => 'low',
+            ];
+        }
+
+        return $found;
+    }
+
+    private function normalizeManualSlugs($manualSlugs)
+    {
+        if (is_string($manualSlugs)) {
+            $manualSlugs = preg_split('~[\s,;]+~u', $manualSlugs, -1, PREG_SPLIT_NO_EMPTY);
+        }
+
+        if (!is_array($manualSlugs)) {
+            return [];
+        }
+
+        $normalized = [];
+        foreach ($manualSlugs as $slug) {
+            $slug = trim((string) $slug);
+            if ($slug === '') {
+                continue;
+            }
+
+            if (preg_match('~/gallery/([^/?#]+)~i', $slug, $match)) {
+                $slug = $match[1];
+            }
+
+            $slug = trim($slug, "/ \t\n\r\0\x0B");
+            if ($slug !== '' && !in_array($slug, $normalized, true)) {
+                $normalized[] = $slug;
+            }
+        }
+
+        return array_slice($normalized, 0, $this->maxValidationRequests);
     }
 
     private function normalizeBaseUrl($inputUrl)
@@ -319,7 +411,7 @@ class VigboGalleryFinder
         return $found;
     }
 
-    private function validateCandidates($candidates, $baseUrl)
+    private function validateCandidates($candidates)
     {
         $galleries = [];
         $validationRequests = 0;
