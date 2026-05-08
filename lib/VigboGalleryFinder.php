@@ -143,7 +143,7 @@ class VigboGalleryFinder
     private function normalizeManualSlugs($manualSlugs)
     {
         if (is_string($manualSlugs)) {
-            $manualSlugs = preg_split('~[\s,;]+~u', $manualSlugs, -1, PREG_SPLIT_NO_EMPTY);
+            $manualSlugs = preg_split('~[\r\n,;]+~u', $manualSlugs, -1, PREG_SPLIT_NO_EMPTY);
         }
 
         if (!is_array($manualSlugs)) {
@@ -162,12 +162,35 @@ class VigboGalleryFinder
             }
 
             $slug = trim($slug, "/ \t\n\r\0\x0B");
-            if ($slug !== '' && !in_array($slug, $normalized, true)) {
-                $normalized[] = $slug;
+            foreach ($this->slugVariants($slug) as $variant) {
+                if ($variant !== '' && !in_array($variant, $normalized, true)) {
+                    $normalized[] = $variant;
+                }
             }
         }
 
         return array_slice($normalized, 0, $this->maxValidationRequests);
+    }
+
+    private function slugVariants($slug)
+    {
+        $slug = trim((string) $slug);
+        if ($slug === '') {
+            return [];
+        }
+
+        $variants = [$slug, strtolower($slug)];
+        if (preg_match('~\s+~u', $slug)) {
+            $spaced = preg_replace('~\s+~u', ' ', $slug);
+            $variants[] = str_replace(' ', '-', $spaced);
+            $variants[] = str_replace(' ', '_', $spaced);
+            $variants[] = str_replace(' ', '', $spaced);
+            $variants[] = strtolower(str_replace(' ', '-', $spaced));
+            $variants[] = strtolower(str_replace(' ', '_', $spaced));
+            $variants[] = strtolower(str_replace(' ', '', $spaced));
+        }
+
+        return array_values(array_unique($variants));
     }
 
     private function normalizeBaseUrl($inputUrl)
@@ -458,18 +481,27 @@ class VigboGalleryFinder
         }
 
         $body = $response['body'];
-        if (stripos($body, 'Страница не найдена') !== false || stripos($body, 'Ошибка 404') !== false) {
+        $title = $this->extractTitle($body);
+        if ($title === '' || in_array($title, ['Страница не найдена', 'Ошибка 404', 'Error 404'], true)) {
             return false;
         }
 
-        return stripos($body, '/gallery/') !== false
-            || stripos($body, 'GalleryPage') !== false
-            || stripos($body, 'passwordPage') !== false;
+        return stripos($body, 'GalleryPageClient') !== false
+            || preg_match('~\\\\?"gallery\\\\?"\s*:\s*\{~', $body)
+            || preg_match('~\\\\?"url\\\\?"\s*:\s*\\\\?"' . preg_quote(basename(parse_url($response['url'], PHP_URL_PATH)), '~') . '\\\\?"~', $body);
     }
 
     private function detectAccess($html)
     {
-        if (stripos($html, 'закрытой галерее') !== false || stripos($html, 'passwordPage') !== false) {
+        if (preg_match('~\\\\?"isPrivate\\\\?"\s*:\s*true~', $html)) {
+            return 'закрытая/по паролю';
+        }
+
+        if (preg_match('~\\\\?"isPrivate\\\\?"\s*:\s*false~', $html)) {
+            return 'публичная';
+        }
+
+        if (stripos($html, 'qa-password-input') !== false) {
             return 'закрытая/по паролю';
         }
 
