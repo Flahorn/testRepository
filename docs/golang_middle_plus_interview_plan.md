@@ -73,7 +73,8 @@
 - defer, panic, recover;
 - generics;
 - standard library;
-- memory model на практическом уровне.
+- memory model на практическом уровне;
+- heap, stack, escape analysis, allocations и влияние GC.
 
 ### Вопросы по языку
 
@@ -97,6 +98,12 @@
 18. Как generics изменили подход к utility-коду? Когда не стоит использовать generics?
 19. Какие пакеты стандартной библиотеки вы используете чаще всего?
 20. Что такое escape analysis и как она может влиять на производительность?
+21. Чем stack отличается от heap в Go?
+22. Где хранятся локальные переменные функции и всегда ли локальная переменная находится на stack?
+23. Почему возврат указателя на локальную переменную безопасен в Go?
+24. Как растет stack goroutine и почему это важно для большого количества goroutines?
+25. Почему утверждение "указатели всегда быстрее" неверно?
+26. Как диагностировать лишние heap allocations?
 
 ### Практические мини-вопросы
 
@@ -1018,99 +1025,209 @@ func Contains[T comparable](xs []T, target T) bool {
 
 **Сильный ответ:** кандидат говорит: сначала измерить allocations и latency, потом оптимизировать горячие paths. Он не делает вывод "указатели всегда быстрее". Иногда value semantics быстрее и проще, потому что меньше heap allocations и лучше cache locality.
 
+
+#### 21. Чем stack отличается от heap в Go?
+
+**Ожидаемый ответ:** stack используется для данных с понятным временем жизни внутри выполнения функции: локальные значения, параметры, return slots и служебные данные вызовов. Heap используется для данных, которые должны жить дольше текущего stack frame или чей lifetime компилятор не может безопасно ограничить stack-ом. Stack дешевле: выделение обычно сводится к сдвигу stack pointer, а освобождение происходит сразу при возврате из функции. Heap дороже: объект должен быть учтен allocator-ом и позже обработан garbage collector-ом.
+
+**Подробное объяснение:** в Go разработчик не выбирает напрямую `stack` или `heap`, как в языках с ручным управлением памятью. Решение принимает компилятор через escape analysis. Поэтому корректнее говорить не "я создал переменную на stack", а "компилятор может разместить это значение на stack, если докажет, что оно не escape-ится".
+
+**Пример для обсуждения:**
+
+```go
+func local() int {
+    x := 10
+    return x
+}
+
+func escaped() *int {
+    x := 10
+    return &x
+}
+```
+
+В первом случае `x` обычно может жить на stack. Во втором `x` должен продолжить жить после возврата функции, поэтому компилятор разместит его так, чтобы указатель оставался валидным, чаще всего на heap.
+
+**Что важно услышать:** stack/heap - это не часть семантики Go-программы, а деталь реализации, влияющая на производительность. Семантически оба варианта безопасны; разница в стоимости allocations и GC pressure.
+
+#### 22. Где хранятся локальные переменные функции и всегда ли локальная переменная находится на stack?
+
+**Ожидаемый ответ:** локальная переменная не обязана находиться на stack. Если она не escape-ится и ее lifetime понятен компилятору, она может быть размещена на stack или даже в register-е/оптимизирована. Если переменная escape-ится, она будет размещена в heap или иначе сохранена так, чтобы оставаться доступной.
+
+**Подробное объяснение:** слово "локальная" описывает область видимости в исходном коде, а не место хранения в памяти. Переменная может быть видима только внутри функции, но при этом попасть в heap, если ссылка на нее уходит наружу через return, closure, interface, goroutine или структуру с более долгим временем жизни.
+
+**Примеры причин escape:**
+
+- функция возвращает `&localVar`;
+- closure захватывает переменную и живет дольше функции;
+- значение передается в interface, и компилятор не может доказать конкретный lifetime;
+- pointer сохраняется в структуру, cache, map или global variable;
+- переменная используется goroutine, которая может выполняться после возврата функции.
+
+**Сильный ответ:** кандидат отделяет scope от lifetime и понимает, что решение принимает компилятор. Он не делает выводы только по синтаксису `&x` или `new(T)` без проверки escape analysis.
+
+#### 23. Почему возврат указателя на локальную переменную безопасен в Go?
+
+**Ожидаемый ответ:** это безопасно, потому что Go compiler видит, что адрес локальной переменной возвращается наружу, и перемещает значение в heap или обеспечивает его корректное время жизни. В Go не возникает dangling pointer на stack frame, как в языках, где можно вернуть адрес локальной переменной вручную без защиты.
+
+**Подробное объяснение:** безопасность не означает бесплатность. Такой код корректен, но может добавить heap allocation. Если это происходит в горячем path, allocations могут увеличить нагрузку на GC и latency. Поэтому вопрос не "можно ли так писать", а "есть ли это на performance-critical пути и измерили ли мы стоимость".
+
+**Пример:**
+
+```go
+func NewUserID(value string) *string {
+    id := strings.TrimSpace(value)
+    return &id
+}
+```
+
+Код безопасен: `id` не исчезнет после возврата. Но если такая функция вызывается миллионы раз в секунду, стоит проверить allocations и, возможно, изменить API на возврат значения.
+
+**Красный флаг:** кандидат говорит, что такой код вернет указатель на уничтоженную stack-память. Это неверно для Go и показывает перенос ментальной модели из C/C++ без учета Go compiler/runtime.
+
+#### 24. Как растет stack goroutine и почему это важно для большого количества goroutines?
+
+**Ожидаемый ответ:** goroutine начинается с небольшого stack, который runtime может увеличивать и, при необходимости, перемещать. Это одна из причин, почему goroutines дешевле OS threads: не нужно заранее резервировать большой stack для каждой goroutine. Но stack не бесплатен: глубокая рекурсия, большие локальные значения и огромное число goroutines увеличивают memory footprint.
+
+**Подробное объяснение:** Go runtime проверяет, хватает ли stack для вызова функции, и может вырастить stack. При росте stack runtime копирует данные в новый участок памяти и обновляет ссылки, которые он умеет отслеживать. Поэтому Go накладывает ограничения на unsafe-паттерны и требует, чтобы runtime мог корректно понимать pointers.
+
+**Практические выводы:**
+
+- goroutine дешевле thread, но unbounded goroutines все равно опасны;
+- большие локальные массивы или структуры могут раздувать stack frame;
+- глубокая рекурсия в Go может быть проблемой, потому что tail-call optimization не является тем, на что стоит рассчитывать;
+- memory profile и goroutine profile помогают понять, где растет потребление памяти.
+
+**Уточняющий вопрос:** если сервис создает goroutine на каждый входящий job без лимита, проблема может быть не только в CPU, но и в stack memory, scheduler overhead, внешних connections и backpressure.
+
+#### 25. Почему утверждение "указатели всегда быстрее" неверно?
+
+**Ожидаемый ответ:** указатель может избежать копирования большого значения, но он также может привести к heap allocation, дополнительной indirection, худшей cache locality и большей нагрузке на GC. Для маленьких структур value semantics часто быстрее, проще и безопаснее.
+
+**Подробное объяснение:** производительность зависит от размера типа, frequency вызовов, escape analysis, cache locality, mutability и API-контракта. Передача `int`, `time.Time` или небольшой struct по значению часто нормальна. Передача большой структуры или структуры с mutex/copy-sensitive полями требует осторожности.
+
+**Пример обсуждения:**
+
+```go
+type Point struct { X, Y int }
+func Distance(a, b Point) float64 { ... }
+```
+
+Здесь pointer receiver/parameters вряд ли помогут. А для большой структуры с большим массивом внутри копирование может быть дорогим. Но если pointer заставит объект escape-иться в heap, итог может стать хуже.
+
+**Сильный ответ:** кандидат предлагает измерять: `go test -bench -benchmem`, pprof, allocation profiles. Он также учитывает читаемость и ownership, а не только micro-optimization.
+
+#### 26. Как диагностировать лишние heap allocations?
+
+**Ожидаемый ответ:** использовать несколько инструментов вместе: `go test -bench -benchmem` для количества allocations в benchmark, `go build -gcflags=-m` для просмотра escape decisions, heap profile в pprof для production-like нагрузки, allocation profile для горячих мест, runtime metrics для GC pressure.
+
+**Подробное объяснение:** `-gcflags=-m` показывает, почему compiler решил переместить значение в heap, но это не говорит автоматически, что проблема важна. Benchmark показывает стоимость конкретного куска кода, а pprof показывает impact на реальной нагрузке. Нужно связывать allocations с latency, CPU, GC pause/time и throughput.
+
+**Типичные источники лишних allocations:**
+
+- частые конвертации `string` <-> `[]byte`;
+- `fmt.Sprintf` в горячем path вместо более дешевой сборки строки;
+- создание временных slices/maps без переиспользования там, где это безопасно;
+- boxing в interface;
+- closures, которые захватывают переменные;
+- JSON encoding/decoding больших структур;
+- логирование с тяжелой подготовкой полей даже при выключенном уровне.
+
+**Что важно услышать:** кандидат не должен обещать "убрать все allocations". Цель - убрать значимые allocations в горячих местах, не ухудшив корректность и читаемость. Иногда allocation дешевле, чем сложный object pool с риском data races и reuse bugs.
+
 ### 17.2 Concurrency и context
 
-#### 21. Чем goroutine отличается от OS thread?
+#### 27. Чем goroutine отличается от OS thread?
 
 **Ожидаемый ответ:** goroutine - легковесная единица выполнения, управляемая Go runtime scheduler. Многие goroutines мультиплексируются на меньшее число OS threads. Goroutine стартует с небольшим stack, который может расти. OS thread тяжелее и управляется ОС.
 
 **Сильный ответ:** кандидат понимает, что легковесность не означает бесплатность: goroutines потребляют память, scheduler time и могут создавать нагрузку на внешние ресурсы.
 
-#### 22. Что приводит к goroutine leak?
+#### 28. Что приводит к goroutine leak?
 
 **Ожидаемый ответ:** goroutine leak возникает, когда goroutine больше не нужна, но не может завершиться. Частые причины: ожидание чтения/записи в channel без получателя/отправителя, отсутствие реакции на context cancellation, бесконечный retry-loop, зависший внешний вызов без timeout.
 
 **Как предотвращать:** передавать context, закрывать каналы с понятным ownership, использовать timeouts, bounded queues, WaitGroup, errgroup, проверять lifecycle в тестах.
 
-#### 23. Как обнаружить goroutine leak в production?
+#### 29. Как обнаружить goroutine leak в production?
 
 **Ожидаемый ответ:** смотреть рост числа goroutines через runtime metrics, pprof goroutine dump, heap/profile, traces, correlating с RPS и ошибками. Если число goroutines растет после завершения нагрузки и не возвращается, это сигнал leak.
 
 **Сильный ответ:** кандидат умеет читать goroutine stack traces и связывать их с конкретным blocking point.
 
-#### 24. Когда использовать channel, а когда mutex?
+#### 30. Когда использовать channel, а когда mutex?
 
 **Ожидаемый ответ:** mutex хорошо подходит для защиты shared state и коротких критических секций. Channel подходит для передачи ownership, coordination, pipeline, fan-out/fan-in, сигналов завершения. Не стоит использовать channel только потому, что это Go, если обычный mutex проще.
 
 **Критерий:** если задача - "защитить map", чаще нужен mutex. Если задача - "передать работу worker-ам и собрать результат", channel подходит естественно.
 
-#### 25. Что происходит при чтении из закрытого channel?
+#### 31. Что происходит при чтении из закрытого channel?
 
 **Ожидаемый ответ:** чтение из закрытого channel немедленно возвращает zero value типа элемента. В comma-ok форме `v, ok := <-ch`, `ok` будет false, когда channel закрыт и буфер пуст.
 
 **Деталь:** если buffered channel закрыли, сначала будут прочитаны оставшиеся элементы, затем начнут возвращаться zero value и `ok=false`.
 
-#### 26. Что происходит при записи в закрытый channel?
+#### 32. Что происходит при записи в закрытый channel?
 
 **Ожидаемый ответ:** запись в закрытый channel вызывает panic. Поэтому закрывать channel должен тот, кто владеет отправкой, обычно sender или координатор sender-ов.
 
 **Красный флаг:** кандидат предлагает закрывать channel со стороны receiver без гарантии, что никто больше не пишет.
 
-#### 27. Для чего нужен select с default?
+#### 33. Для чего нужен select с default?
 
 **Ожидаемый ответ:** `default` делает `select` неблокирующим. Это полезно для попытки отправки/получения без ожидания, polling, drop policy при переполненной очереди. Но в цикле `for { select { default: } }` можно получить busy loop и загрузить CPU.
 
 **Хорошая практика:** если нужен цикл, часто добавляют blocking case, timer/ticker или backoff.
 
-#### 28. Как реализовать fan-out/fan-in?
+#### 34. Как реализовать fan-out/fan-in?
 
 **Ожидаемый ответ:** fan-out: несколько worker goroutines читают задачи из общего input channel. Fan-in: результаты нескольких worker-ов собираются в один output channel. Нужны WaitGroup для закрытия output после завершения всех worker-ов и context для отмены.
 
 **Сильный ответ:** кандидат учитывает backpressure через bounded channels и не забывает закрыть output только после завершения всех отправителей.
 
-#### 29. Как ограничить количество одновременно выполняющихся задач?
+#### 35. Как ограничить количество одновременно выполняющихся задач?
 
 **Ожидаемый ответ:** использовать worker pool фиксированного размера, semaphore на buffered channel, `errgroup` с limit, или rate limiter. Выбор зависит от того, есть ли очередь задач, нужны ли результаты и как обрабатывается отмена.
 
 **Пример:** buffered channel `sem := make(chan struct{}, limit)`; перед запуском работы отправляем token, после завершения освобождаем token через defer.
 
-#### 30. Как корректно остановить worker pool?
+#### 36. Как корректно остановить worker pool?
 
 **Ожидаемый ответ:** закрыть input channel, чтобы worker-ы завершили range; или отменить context, чтобы worker-ы прекратили ожидание/работу. Координатор ждет worker-ы через WaitGroup. Output channel закрывается после завершения всех worker-ов.
 
 **Сильный ответ:** кандидат объясняет, как избежать отправки в закрытый channel и как завершить обработку частичных результатов.
 
-#### 31. Как работает context.Context и что нельзя хранить в context?
+#### 37. Как работает context.Context и что нельзя хранить в context?
 
 **Ожидаемый ответ:** context переносит deadline, cancellation signal и request-scoped values через границы API. Его нужно передавать первым параметром функции. В context не хранят optional parameters, большие объекты, mutable state, database handles, logger как обязательную зависимость, если это ломает явный контракт.
 
 **Практика:** context values подходят для request id, trace id, auth claims, если они действительно request-scoped.
 
-#### 32. Почему нельзя игнорировать ctx.Done() в долгих операциях?
+#### 38. Почему нельзя игнорировать ctx.Done() в долгих операциях?
 
 **Ожидаемый ответ:** если операция не слушает context, она продолжит потреблять ресурсы после отмены запроса, timeout клиента или shutdown. Это ведет к goroutine leaks, лишней нагрузке и медленному завершению сервиса.
 
 **Пример:** worker, который делает HTTP requests, должен создавать request через `http.NewRequestWithContext`.
 
-#### 33. Что такое data race?
+#### 39. Что такое data race?
 
 **Ожидаемый ответ:** data race возникает, когда две goroutines одновременно обращаются к одной памяти, хотя бы одна операция - запись, и между ними нет synchronization. Поведение программы становится неопределенным с точки зрения Go memory model.
 
 **Как искать:** `go test -race`, code review, pprof/block/mutex profiles. Race detector помогает, но проверяет только выполненные paths, поэтому не доказывает отсутствие races.
 
-#### 34. Когда использовать sync/atomic вместо mutex?
+#### 40. Когда использовать sync/atomic вместо mutex?
 
 **Ожидаемый ответ:** atomic подходит для простых независимых операций над числами/указателями: counters, flags, copy-on-write pointers. Mutex лучше для сложных инвариантов, нескольких полей, map/slice, операций read-modify-write над структурой.
 
 **Риск:** atomic-код легко сделать формально race-free, но логически неверным. Для Middle+ важно выбирать читаемость и корректность.
 
-#### 35. Что такое backpressure?
+#### 41. Что такое backpressure?
 
 **Ожидаемый ответ:** backpressure - механизм, который не дает producer-ам бесконечно генерировать работу быстрее, чем consumers могут ее обработать. Реализация: bounded queues, rate limiting, semaphore, отказ с 429/503, drop policy, circuit breaker.
 
 **Сильный ответ:** кандидат связывает backpressure с защитой памяти, внешних зависимостей и latency.
 
-#### 36. Как сделать graceful shutdown HTTP-сервера?
+#### 42. Как сделать graceful shutdown HTTP-сервера?
 
 **Ожидаемый ответ:** поймать SIGTERM/SIGINT, перестать принимать новые запросы через `http.Server.Shutdown(ctx)`, дать текущим запросам deadline на завершение, остановить background workers, закрыть подключения к БД/очередям после завершения работы, экспортировать readiness=false до остановки.
 
@@ -1118,91 +1235,91 @@ func Contains[T comparable](xs []T, target T) bool {
 
 ### 17.3 Backend, API и данные
 
-#### 37. Как проектировать REST API для нового ресурса?
+#### 43. Как проектировать REST API для нового ресурса?
 
 **Ожидаемый ответ:** начать с доменной модели и операций над ресурсами, определить URL, методы, request/response schemas, status codes, validation errors, idempotency, pagination, authorization, versioning. API должен быть стабильным контрактом, а не отражением внутренней структуры БД.
 
 **Пример:** `GET /users/{id}`, `POST /users`, `PATCH /users/{id}`. Ошибки возвращаются в едином формате с machine-readable code и human-readable message.
 
-#### 38. Какие HTTP-коды использовать для типовых ошибок?
+#### 44. Какие HTTP-коды использовать для типовых ошибок?
 
 **Ожидаемый ответ:** `400 Bad Request` для синтаксически неверного запроса, `422 Unprocessable Entity` для валидного JSON с доменной validation error, `401 Unauthorized` для отсутствующей/невалидной аутентификации, `403 Forbidden` для запрета при известной личности, `404 Not Found`, `409 Conflict`, `429 Too Many Requests`, `500` для unexpected server errors, `503` для временной недоступности.
 
 **Сильный ответ:** кандидат не раскрывает internal error клиенту, но логирует details с correlation id.
 
-#### 39. Где должна жить бизнес-логика: handler, service или repository?
+#### 45. Где должна жить бизнес-логика: handler, service или repository?
 
 **Ожидаемый ответ:** handler отвечает за transport: parsing, validation на уровне формата, auth context, mapping errors to HTTP. Service содержит бизнес-правила и транзакционные use cases. Repository отвечает за persistence и SQL/DB details.
 
 **Практический критерий:** бизнес-правило должно тестироваться без HTTP и желательно без реальной БД, если это не integration test.
 
-#### 40. Как реализовать idempotency для POST-запроса?
+#### 46. Как реализовать idempotency для POST-запроса?
 
 **Ожидаемый ответ:** клиент отправляет idempotency key. Сервер сохраняет ключ, fingerprint запроса, статус выполнения и результат. Повторный запрос с тем же ключом и тем же fingerprint возвращает тот же результат. Если fingerprint отличается - ошибка conflict.
 
 **Важные детали:** атомарное сохранение ключа и результата, TTL для ключей, защита от гонок, учет пользователя/tenant в scope ключа.
 
-#### 41. Когда выбирать gRPC вместо REST?
+#### 47. Когда выбирать gRPC вместо REST?
 
 **Ожидаемый ответ:** gRPC хорош для internal service-to-service communication, строгих контрактов protobuf, streaming, низкой latency, code generation, polyglot environments. REST проще для публичных API, браузеров, дебага через curl и широкого ecosystem.
 
 **Сильный ответ:** выбор зависит от клиентов, инфраструктуры, observability, backward compatibility и требований к streaming.
 
-#### 42. Что такое транзакция?
+#### 48. Что такое транзакция?
 
 **Ожидаемый ответ:** транзакция - группа операций с ACID-свойствами: atomicity, consistency, isolation, durability. `commit` фиксирует изменения, `rollback` отменяет их. Транзакция нужна, когда несколько изменений должны произойти как единое целое.
 
 **Практика в Go:** context-aware `BeginTx`, `defer rollback`, явный `commit`, аккуратная обработка ошибки commit.
 
-#### 43. Какие уровни изоляции транзакций вы знаете?
+#### 49. Какие уровни изоляции транзакций вы знаете?
 
 **Ожидаемый ответ:** Read Uncommitted, Read Committed, Repeatable Read, Serializable. В PostgreSQL Read Uncommitted фактически работает как Read Committed. Более высокий уровень уменьшает аномалии, но может увеличить блокировки, serialization failures и стоимость.
 
 **Сильный ответ:** кандидат говорит не только названия, но и какие аномалии предотвращаются и как это влияет на retry транзакций.
 
-#### 44. Что такое dirty read, non-repeatable read, phantom read?
+#### 50. Что такое dirty read, non-repeatable read, phantom read?
 
 **Ожидаемый ответ:** dirty read - чтение незакоммиченных данных другой транзакции. Non-repeatable read - повторное чтение той же строки в одной транзакции дает другой результат из-за commit другой транзакции. Phantom read - повторный запрос по условию возвращает другой набор строк из-за вставок/удалений другой транзакции.
 
-#### 45. Как избежать lost update?
+#### 51. Как избежать lost update?
 
 **Ожидаемый ответ:** использовать row-level locks (`SELECT ... FOR UPDATE`), atomic update with condition (`UPDATE accounts SET balance=balance-? WHERE id=? AND balance>=?`), optimistic locking через version column, или serializable transaction с retry.
 
 **Сильный ответ:** кандидат учитывает deadlocks, порядок блокировок и retry policy.
 
-#### 46. Как работает optimistic locking?
+#### 52. Как работает optimistic locking?
 
 **Ожидаемый ответ:** у записи есть версия или updated_at. При обновлении запрос включает старую версию: `UPDATE table SET ..., version=version+1 WHERE id=? AND version=?`. Если affected rows = 0, значит запись изменилась конкурентно, нужно повторить чтение/операцию или вернуть conflict.
 
-#### 47. Как выбрать индекс для SQL-запроса?
+#### 53. Как выбрать индекс для SQL-запроса?
 
 **Ожидаемый ответ:** смотреть WHERE, JOIN, ORDER BY, GROUP BY, selectivity, cardinality и реальные query plans через `EXPLAIN ANALYZE`. Композитный индекс должен учитывать порядок колонок и pattern запроса.
 
 **Важная деталь:** индекс ускоряет чтение, но замедляет записи и занимает место. Индексы нужны под реальные запросы, а не "на всякий случай".
 
-#### 48. Почему индекс может не использоваться?
+#### 54. Почему индекс может не использоваться?
 
 **Ожидаемый ответ:** низкая selectivity, функция над индексируемой колонкой, несовпадение типов, leading wildcard в LIKE, устаревшая статистика, planner считает seq scan дешевле, неправильный порядок колонок в composite index.
 
-#### 49. Что такое N+1 problem и как исправлять?
+#### 55. Что такое N+1 problem и как исправлять?
 
 **Ожидаемый ответ:** N+1 возникает, когда после одного запроса списка для каждого элемента делается отдельный запрос деталей. Исправление: JOIN, batch query `WHERE id IN (...)`, preloading, dataloader pattern, изменение API/агрегации.
 
 **Сильный ответ:** кандидат думает о лимитах batch size и размере результата.
 
-#### 50. Как проектировать миграции без downtime?
+#### 56. Как проектировать миграции без downtime?
 
 **Ожидаемый ответ:** использовать expand/contract pattern. Сначала добавить backward-compatible schema changes, затем задеплоить код, который пишет/читает новое поле, выполнить backfill батчами, переключить чтение, потом удалить старое поле отдельным релизом.
 
 **Риски:** долгие locks, default values на больших таблицах, backfill без throttling, несовместимость старой и новой версии сервиса.
 
-#### 51. Как хранить nullable-поля в Go?
+#### 57. Как хранить nullable-поля в Go?
 
 **Ожидаемый ответ:** варианты: `sql.NullString` и аналоги, pointer fields, custom nullable-типы, nullable-типы ORM/driver. Выбор зависит от различия между "отсутствует", "null" и zero value.
 
 **Сильный ответ:** кандидат учитывает JSON serialization и доменную модель, а не просто технический тип БД.
 
-#### 52. Offset vs cursor pagination?
+#### 58. Offset vs cursor pagination?
 
 **Ожидаемый ответ:** offset pagination проста, но на больших данных становится медленной и нестабильной при вставках/удалениях. Cursor pagination использует stable sort key и cursor, лучше для больших списков и realtime changes, но сложнее для произвольного перехода на страницу.
 
@@ -1210,31 +1327,31 @@ func Contains[T comparable](xs []T, target T) bool {
 
 ### 17.4 Reliability и внешние зависимости
 
-#### 53. Что такое timeout, retry и circuit breaker?
+#### 59. Что такое timeout, retry и circuit breaker?
 
 **Ожидаемый ответ:** timeout ограничивает время ожидания операции. Retry повторяет временно неуспешную операцию. Circuit breaker временно прекращает вызовы к нестабильной зависимости, чтобы дать ей восстановиться и защитить свой сервис.
 
 **Сильный ответ:** эти механизмы должны использоваться вместе с idempotency, backoff, jitter, retry budget и observability.
 
-#### 54. Почему retries могут ухудшить инцидент?
+#### 60. Почему retries могут ухудшить инцидент?
 
 **Ожидаемый ответ:** retries увеличивают нагрузку на уже деградирующую зависимость, могут вызвать retry storm, дублировать side effects и увеличить latency. Без backoff и лимитов retries часто превращают частичный сбой в полный.
 
 **Правильный подход:** retry только для retryable errors, ограниченное число попыток, exponential backoff with jitter, timeout на всю операцию, idempotency key для side-effect операций.
 
-#### 55. Что такое partial failure?
+#### 61. Что такое partial failure?
 
 **Ожидаемый ответ:** ситуация, когда часть операции успешна, а часть нет: один downstream ответил, другой нет; запись в БД прошла, публикация события нет; часть batch обработана. Distributed systems должны проектироваться с учетом partial failure.
 
 **Паттерны:** transactions там, где возможно, outbox, sagas, compensating actions, idempotent consumers, reconciliation jobs.
 
-#### 56. Как проектировать взаимодействие с внешним API?
+#### 62. Как проектировать взаимодействие с внешним API?
 
 **Ожидаемый ответ:** явные timeouts, retries с backoff, circuit breaker, rate limiting, idempotency для side effects, typed client, contract tests, обработка статусов, structured logging без секретов, metrics по latency/errors, fallback или graceful degradation.
 
 ### 17.5 Практические задачи: ожидаемые решения
 
-#### 57. In-memory rate limiter: какой алгоритм выбрать?
+#### 63. In-memory rate limiter: какой алгоритм выбрать?
 
 **Ожидаемый ответ:** для простой задачи подойдет fixed window, но у него есть burst на границе окна. Sliding window точнее, но сложнее и дороже. Token bucket хорошо контролирует среднюю скорость и допускает ограниченный burst. Для API часто выбирают token bucket или sliding window в зависимости от требований.
 
@@ -1242,13 +1359,13 @@ func Contains[T comparable](xs []T, target T) bool {
 
 **Ограничение:** in-memory limiter не работает корректно при нескольких инстансах без sticky sessions или внешнего shared storage вроде Redis.
 
-#### 58. Concurrent fetch with timeout: как должна выглядеть архитектура?
+#### 64. Concurrent fetch with timeout: как должна выглядеть архитектура?
 
 **Ожидаемый ответ:** создать context с общим timeout или принять внешний context, ограничить параллелизм worker pool/semaphore, каждый request создавать через `http.NewRequestWithContext`, результаты отправлять в channel или защищенную структуру, дождаться worker-ов, закрыть result channel, вернуть частичные результаты и агрегированную ошибку.
 
 **Важные edge cases:** `limit <= 0`, пустой список URL, отмена context до старта, зависший сервер, не-2xx статус, сохранение порядка результатов, отсутствие goroutine leaks.
 
-#### 59. Transactional money transfer: как решить безопасно?
+#### 65. Transactional money transfer: как решить безопасно?
 
 **Ожидаемый ответ:** начать транзакцию на уровне service/use case, заблокировать счета в детерминированном порядке по id через `SELECT ... FOR UPDATE`, проверить существование и баланс, выполнить debit/credit, записать audit log, commit. Доменные ошибки отделить от инфраструктурных.
 
@@ -1256,63 +1373,63 @@ func Contains[T comparable](xs []T, target T) bool {
 
 ### 17.6 Тестирование
 
-#### 60. Что такое table-driven tests?
+#### 66. Что такое table-driven tests?
 
 **Ожидаемый ответ:** тесты, где набор кейсов описан таблицей структур, а один test loop прогоняет функцию на каждом кейсе. Это снижает дублирование и делает edge cases явными.
 
 **Хорошая практика:** использовать `t.Run(name, func(t *testing.T) {...})`, не забывать capture переменной в старых версиях Go/при параллельных тестах, проверять и happy path, и ошибки.
 
-#### 61. Как тестировать код, зависящий от времени?
+#### 67. Как тестировать код, зависящий от времени?
 
 **Ожидаемый ответ:** не вызывать `time.Now()` глубоко в бизнес-логике напрямую. Передавать clock interface/function, использовать fixed time в тестах, контролируемый fake clock для timers/tickers.
 
 **Риск:** тесты со sleep обычно flaky и медленные.
 
-#### 62. Как тестировать HTTP handler?
+#### 68. Как тестировать HTTP handler?
 
 **Ожидаемый ответ:** использовать `httptest.NewRequest`, `httptest.ResponseRecorder`, подменять service dependency mock/fake-ом, проверять status code, headers, body, error mapping. Для интеграционного уровня можно поднимать `httptest.Server`.
 
-#### 63. Как тестировать интеграцию с БД?
+#### 69. Как тестировать интеграцию с БД?
 
 **Ожидаемый ответ:** использовать отдельную тестовую БД, миграции, transaction rollback per test или очистку данных, testcontainers/docker при возможности, fixtures/factories, проверять реальные constraints и SQL behavior.
 
 **Сильный ответ:** кандидат разделяет unit tests repository mocks и integration tests с реальной БД.
 
-#### 64. Когда использовать mocks, fakes и testcontainers?
+#### 70. Когда использовать mocks, fakes и testcontainers?
 
 **Ожидаемый ответ:** mocks подходят для проверки взаимодействий на границах, но ими легко закрепить implementation details. Fakes часто лучше для доменной логики. Testcontainers/реальная инфраструктура нужны, когда важно поведение драйвера, SQL, брокера, транзакций.
 
 ### 17.7 Performance и profiling
 
-#### 65. Как понять, где bottleneck: CPU, память, БД или сеть?
+#### 71. Как понять, где bottleneck: CPU, память, БД или сеть?
 
 **Ожидаемый ответ:** начать с метрик: latency breakdown, CPU, memory, GC, DB query duration, connection pool stats, network errors. Затем использовать pprof, tracing, logs с correlation id. Без измерений оптимизация будет гаданием.
 
-#### 66. Как использовать pprof?
+#### 72. Как использовать pprof?
 
 **Ожидаемый ответ:** подключить `net/http/pprof` или собрать профиль программно, снять cpu/heap/goroutine/mutex/block profiles, открыть через `go tool pprof`, смотреть top, list, web/flamegraph. Профилировать нужно под репрезентативной нагрузкой.
 
-#### 67. Что может привести к высокому GC pressure?
+#### 73. Что может привести к высокому GC pressure?
 
 **Ожидаемый ответ:** большое число short-lived allocations, лишние conversions `[]byte`/`string`, создание объектов в горячих циклах, неограниченные buffers, крупные временные структуры, чрезмерное логирование/JSON encoding.
 
 **Исправление:** измерить allocations benchmark-ами и heap profile, переиспользовать buffers осторожно, уменьшить промежуточные объекты, stream processing вместо загрузки всего в память.
 
-#### 68. Как искать memory leak в Go?
+#### 74. Как искать memory leak в Go?
 
 **Ожидаемый ответ:** в Go leak часто означает удержание ссылок или goroutine leak. Сравнить heap profiles во времени, смотреть goroutine dump, проверять caches без eviction, slices, которые держат большой backing array, global maps, channels/workers.
 
 ### 17.8 Observability и эксплуатация
 
-#### 69. Какие structured logs нужны HTTP-сервису?
+#### 75. Какие structured logs нужны HTTP-сервису?
 
 **Ожидаемый ответ:** request id/trace id, method, path/route pattern, status, latency, user/tenant id при допустимости, error code, dependency name/status/latency для downstream errors. Нельзя логировать пароли, токены, персональные данные без необходимости.
 
-#### 70. Какие RED/USE-метрики вы знаете?
+#### 76. Какие RED/USE-метрики вы знаете?
 
 **Ожидаемый ответ:** RED для сервисов: Rate, Errors, Duration. USE для ресурсов: Utilization, Saturation, Errors. Для HTTP нужны RPS, error rate, latency percentiles, in-flight requests. Для БД - pool usage, query latency, errors.
 
-#### 71. Readiness vs liveness?
+#### 77. Readiness vs liveness?
 
 **Ожидаемый ответ:** liveness отвечает, жив ли процесс и нужно ли его перезапустить. Readiness отвечает, готов ли инстанс принимать трафик. При shutdown readiness должна стать false до остановки обработки.
 
@@ -1320,77 +1437,77 @@ func Contains[T comparable](xs []T, target T) bool {
 
 ### 17.9 Security
 
-#### 72. Как хранить пароли пользователей?
+#### 78. Как хранить пароли пользователей?
 
 **Ожидаемый ответ:** никогда не хранить plaintext. Использовать password hashing algorithms с солью и work factor: bcrypt, scrypt, Argon2id. Соль должна быть уникальной, pepper можно хранить отдельно в secret manager. Нужно поддерживать rehash при изменении параметров.
 
-#### 73. Authentication vs authorization?
+#### 79. Authentication vs authorization?
 
 **Ожидаемый ответ:** authentication подтверждает, кто пользователь. Authorization решает, что этому пользователю разрешено. Пользователь может быть аутентифицирован, но не иметь доступа к ресурсу.
 
-#### 74. Как устроен JWT и какие риски?
+#### 80. Как устроен JWT и какие риски?
 
 **Ожидаемый ответ:** JWT состоит из header, payload claims и signature. Риски: long-lived tokens, невозможность простого revoke без state, неправильная проверка alg/audience/issuer/expiration, хранение секретных данных в payload, утечка токена.
 
 **Практика:** короткий TTL access token, refresh flow, проверка `iss`, `aud`, `exp`, key rotation, HTTPS, безопасное хранение на клиенте.
 
-#### 75. Как защищаться от SQL injection?
+#### 81. Как защищаться от SQL injection?
 
 **Ожидаемый ответ:** использовать parameterized queries/prepared statements, не конкатенировать user input в SQL, валидировать identifiers отдельно через allowlist, ограничивать права DB user. ORM не гарантирует защиту, если разработчик вставляет raw SQL небезопасно.
 
 ### 17.10 Code review
 
-#### 76. Как ревьюить PR с business logic в handler?
+#### 82. Как ревьюить PR с business logic в handler?
 
 **Ожидаемый ответ:** указать, что handler смешивает transport и доменную логику, из-за чего код сложнее тестировать и переиспользовать. Предложить вынести use case в service, оставить в handler parsing/auth/error mapping. Попросить unit tests на service и handler tests на HTTP mapping.
 
 **Хороший комментарий:** "Давай вынесем расчет лимита в service: так мы сможем протестировать бизнес-правила без HTTP и не будем дублировать их при появлении gRPC endpoint".
 
-#### 77. Как приоритизировать замечания в code review?
+#### 83. Как приоритизировать замечания в code review?
 
 **Ожидаемый ответ:** сначала correctness, security, data loss, race conditions, observability, backward compatibility. Затем maintainability и тестируемость. Стиль и вкусовые предпочтения должны быть автоматизированы линтерами или помечены как non-blocking.
 
 ### 17.11 System design: сервис уведомлений
 
-#### 78. Какой базовый дизайн предложить?
+#### 84. Какой базовый дизайн предложить?
 
 **Ожидаемый ответ:** API принимает событие, валидирует его и сохраняет durable record. Через outbox или транзакционную публикацию событие попадает в брокер. Worker-ы отправляют email/SMS/push через provider clients. Статусы и попытки сохраняются в БД. Для retry используется delayed queue/backoff, для исчерпанных попыток - DLQ.
 
 **Компоненты:** ingress API, DB, outbox publisher, message broker, workers per channel/provider, template service, status storage, metrics/logs/traces, admin/reconciliation tooling.
 
-#### 79. Как не отправить уведомление дважды?
+#### 85. Как не отправить уведомление дважды?
 
 **Ожидаемый ответ:** использовать idempotency key/event id, unique constraint на `(tenant_id, event_id, channel)`, idempotent consumer, хранить provider message id, дедуплицировать retries. При at-least-once доставке нужно проектировать consumers как idempotent.
 
-#### 80. Как гарантировать, что событие не потеряется?
+#### 86. Как гарантировать, что событие не потеряется?
 
 **Ожидаемый ответ:** сохранить событие в durable storage в рамках транзакции с outbox record. Отдельный publisher читает outbox и публикует в брокер, помечая опубликованное. Если publisher падает, он продолжает с непубликованных записей. Брокер должен подтверждать запись, consumer - ack после успешной обработки.
 
 **Сильный ответ:** кандидат признает, что exactly-once в распределенных системах обычно заменяется at-least-once + idempotency.
 
-#### 81. Что делать, если SMS-провайдер недоступен 30 минут?
+#### 87. Что делать, если SMS-провайдер недоступен 30 минут?
 
 **Ожидаемый ответ:** circuit breaker открывается, retries идут с backoff и jitter, задачи остаются в очереди или delayed retry storage, критичные уведомления можно переключить на fallback provider, некритичные деградировать. Нужны alerts по error rate, queue lag, delivery latency.
 
-#### 82. Какие метрики нужны сервису уведомлений?
+#### 88. Какие метрики нужны сервису уведомлений?
 
 **Ожидаемый ответ:** accepted events rate, validation errors, queue lag, send attempts, success/failure by channel/provider, retry count, DLQ size, delivery latency percentiles, provider latency/status, template rendering errors, worker saturation.
 
 ### 17.12 Поведенческий блок: что считать сильным ответом
 
-#### 83. Кандидат не согласился с техническим решением команды. Что слушать в ответе?
+#### 89. Кандидат не согласился с техническим решением команды. Что слушать в ответе?
 
 **Сильный ответ:** кандидат сначала понял контекст и ограничения, сформулировал риски, предложил альтернативы, обсудил trade-off, принял командное решение после дискуссии и помог его реализовать. Важно отсутствие позиции "я один был прав, остальные не понимали".
 
-#### 84. Кандидат ошибся в production. Что слушать?
+#### 90. Кандидат ошибся в production. Что слушать?
 
 **Сильный ответ:** конкретное описание инцидента, impact, timeline, mitigation, root cause, follow-up actions. Кандидат не перекладывает вину, говорит о системных улучшениях: tests, alerts, rollout strategy, runbook, feature flag.
 
-#### 85. Как кандидат выбирает между quick fix и refactoring?
+#### 91. Как кандидат выбирает между quick fix и refactoring?
 
 **Сильный ответ:** оценивает impact, срочность, риск регрессии, blast radius, наличие тестов. В инциденте сначала безопасная стабилизация, затем отдельный follow-up на системное исправление. Если quick fix создает долг, он должен быть видимым и запланированным.
 
-#### 86. Как кандидат помогает менее опытному разработчику?
+#### 92. Как кандидат помогает менее опытному разработчику?
 
 **Сильный ответ:** задает вопросы, объясняет reasoning, дает небольшие самостоятельные задачи, делает pairing, пишет понятные review comments, делится контекстом. Не забирает задачу полностью и не унижает за ошибки.
 
@@ -1398,7 +1515,7 @@ func Contains[T comparable](xs []T, target T) bool {
 
 Этот блок стоит использовать, если роль предполагает самостоятельную работу с PostgreSQL/MySQL, проектирование схемы, оптимизацию запросов, миграции и разбор production-проблем с данными. Вопросы можно задавать выборочно: для Middle+ важно не знать все названия наизусть, а уметь объяснять причинно-следственные связи и выбирать безопасное решение.
 
-#### 87. Что происходит внутри БД при выполнении SQL-запроса?
+#### 93. Что происходит внутри БД при выполнении SQL-запроса?
 
 **Ожидаемый ответ:** в общем виде запрос проходит parsing, semantic analysis, rewrite, planning/optimization и execution. Planner выбирает план на основе статистики, доступных индексов, оценочной стоимости чтения страниц, фильтрации, join strategy и сортировок. Executor выполняет выбранный план и возвращает строки клиенту.
 
@@ -1406,7 +1523,7 @@ func Contains[T comparable](xs []T, target T) bool {
 
 **Сильный ответ:** кандидат упоминает статистику, cardinality/selectivity, join algorithms, сортировки и то, что план может измениться после роста данных.
 
-#### 88. Чем `EXPLAIN` отличается от `EXPLAIN ANALYZE`?
+#### 94. Чем `EXPLAIN` отличается от `EXPLAIN ANALYZE`?
 
 **Ожидаемый ответ:** `EXPLAIN` показывает предполагаемый план и оценочные стоимости без выполнения запроса. `EXPLAIN ANALYZE` реально выполняет запрос и показывает фактическое время, количество строк, loops и расхождения между оценками и реальностью.
 
@@ -1414,7 +1531,7 @@ func Contains[T comparable](xs []T, target T) bool {
 
 **Осторожность:** `EXPLAIN ANALYZE` для `INSERT/UPDATE/DELETE` выполняет изменение. В production его нужно использовать аккуратно, иногда внутри rollback-транзакции или на replica/staging.
 
-#### 89. Какие поля в `EXPLAIN ANALYZE` вы смотрите первыми?
+#### 95. Какие поля в `EXPLAIN ANALYZE` вы смотрите первыми?
 
 **Ожидаемый ответ:** actual time, actual rows, loops, разницу estimated rows vs actual rows, тип scan, join type, sort method, heap fetches, buffers при `BUFFERS`, filter rows removed, наличие temporary files.
 
@@ -1422,7 +1539,7 @@ func Contains[T comparable](xs []T, target T) bool {
 
 **Сильный ответ:** кандидат умеет объяснить, почему один node с `loops=10000` может давать основную задержку даже при маленьком времени одного loop.
 
-#### 90. Что такое selectivity и cardinality индекса?
+#### 96. Что такое selectivity и cardinality индекса?
 
 **Ожидаемый ответ:** cardinality - количество уникальных значений в колонке или наборе колонок. Selectivity - насколько условие фильтрует данные: какую долю строк оно оставляет. Чем выше selectivity условия, тем полезнее индекс.
 
@@ -1430,7 +1547,7 @@ func Contains[T comparable](xs []T, target T) bool {
 
 **Пример:** для таблицы заказов индекс по `user_id` обычно полезен, если запросы выбирают заказы одного пользователя из миллионов строк. Индекс по `is_deleted`, где почти все строки `false`, часто не помогает без partial condition.
 
-#### 91. Как работает composite index и почему важен порядок колонок?
+#### 97. Как работает composite index и почему важен порядок колонок?
 
 **Ожидаемый ответ:** composite index строится по нескольким колонкам в заданном порядке. Для B-tree эффективно используется leftmost prefix: индекс `(tenant_id, created_at, id)` хорошо подходит для фильтра по `tenant_id` и сортировки/диапазона по `created_at`, но не так полезен для запроса только по `created_at` без `tenant_id`.
 
@@ -1438,7 +1555,7 @@ func Contains[T comparable](xs []T, target T) bool {
 
 **Сильный ответ:** кандидат не отвечает универсальным "самую селективную колонку первой" без контекста. Для multi-tenant систем `tenant_id` часто первым нужен для изоляции данных и pruning, даже если другая колонка более селективна глобально.
 
-#### 92. Чем B-tree, Hash, GIN и GiST индексы отличаются на практике?
+#### 98. Чем B-tree, Hash, GIN и GiST индексы отличаются на практике?
 
 **Ожидаемый ответ:** B-tree - основной индекс для equality, range, ordering. Hash - для equality, но в PostgreSQL используется реже, потому что B-tree обычно достаточно универсален. GIN полезен для массивов, JSONB, full-text search, containment. GiST полезен для геоданных, ranges, similarity и некоторых custom operators.
 
@@ -1446,7 +1563,7 @@ func Contains[T comparable](xs []T, target T) bool {
 
 **Пример:** `WHERE data @> '{"role":"admin"}'` может выиграть от GIN по JSONB, а `WHERE lower(email)=...` требует либо хранения нормализованного email, либо expression index на `lower(email)`.
 
-#### 93. Что такое covering index / index-only scan?
+#### 99. Что такое covering index / index-only scan?
 
 **Ожидаемый ответ:** index-only scan возможен, когда БД может ответить на запрос, используя только индекс, без чтения строк таблицы. Для этого нужные колонки должны быть в индексе, а visibility information должна позволять не ходить в heap.
 
@@ -1454,7 +1571,7 @@ func Contains[T comparable](xs []T, target T) bool {
 
 **Практический вывод:** `INCLUDE`-колонки могут помочь покрыть запрос, но каждый дополнительный индекс и каждая включенная колонка увеличивают размер индекса и стоимость записи.
 
-#### 94. Что такое partial index и когда он полезен?
+#### 100. Что такое partial index и когда он полезен?
 
 **Ожидаемый ответ:** partial index индексирует только строки, удовлетворяющие условию. Он полезен, когда запросы часто работают с маленьким подмножеством данных: активные записи, pending jobs, не удаленные сущности, конкретный tenant tier.
 
@@ -1462,7 +1579,7 @@ func Contains[T comparable](xs []T, target T) bool {
 
 **Объяснение:** partial index меньше, быстрее обновляется и лучше помещается в cache. Но planner использует его только если условие запроса логически соответствует predicate индекса.
 
-#### 95. Что такое expression index?
+#### 101. Что такое expression index?
 
 **Ожидаемый ответ:** expression index строится по выражению, а не по сырой колонке: например `CREATE INDEX ON users (lower(email));`. Он полезен, когда запрос фильтрует или сортирует по вычисляемому выражению.
 
@@ -1470,7 +1587,7 @@ func Contains[T comparable](xs []T, target T) bool {
 
 **Риск:** expression должен совпадать с запросом, а функции должны быть подходящими для индексации. Также индекс увеличивает стоимость записи.
 
-#### 96. Почему слишком много индексов - проблема?
+#### 102. Почему слишком много индексов - проблема?
 
 **Ожидаемый ответ:** каждый индекс занимает место, должен обновляться при insert/update/delete, увеличивает WAL/redo log, может замедлять bulk operations, усложняет planning и повышает требования к cache.
 
@@ -1478,7 +1595,7 @@ func Contains[T comparable](xs []T, target T) bool {
 
 **Сильный ответ:** кандидат предлагает отслеживать unused indexes, slow queries, write amplification и удалять индексы после проверки.
 
-#### 97. Что такое transaction isolation anomaly на примере lost update?
+#### 103. Что такое transaction isolation anomaly на примере lost update?
 
 **Ожидаемый ответ:** lost update возникает, когда две транзакции читают одно значение, независимо считают новое и записывают результат, из-за чего одно обновление затирает другое.
 
@@ -1486,7 +1603,7 @@ func Contains[T comparable](xs []T, target T) bool {
 
 **Как избежать:** atomic update с условием, row lock `FOR UPDATE`, optimistic locking по version, serializable isolation с retry. Просто обернуть операции в транзакцию недостаточно, если изоляция и locking не предотвращают гонку.
 
-#### 98. Что такое write skew?
+#### 104. Что такое write skew?
 
 **Ожидаемый ответ:** write skew - аномалия, когда две транзакции читают общий набор данных, принимают решение, а затем обновляют разные строки так, что нарушается инвариант, хотя прямого конфликта записи в одну строку нет.
 
@@ -1494,7 +1611,7 @@ func Contains[T comparable](xs []T, target T) bool {
 
 **Как избежать:** serializable isolation, explicit locks на набор/таблицу/агрегат, материализованный invariant row, constraints там, где возможно. Middle+ должен понимать, что row-level lock одной строки не всегда защищает инвариант над набором строк.
 
-#### 99. Что такое phantom read и почему он важен для бизнес-инвариантов?
+#### 105. Что такое phantom read и почему он важен для бизнес-инвариантов?
 
 **Ожидаемый ответ:** phantom read возникает, когда повторный запрос по условию внутри транзакции видит новый набор строк из-за вставки/удаления другой транзакции. Это важно, если бизнес-правило зависит от количества или отсутствия строк.
 
@@ -1502,7 +1619,7 @@ func Contains[T comparable](xs []T, target T) bool {
 
 **Практический вывод:** инварианты лучше закреплять constraints/unique indexes, а не только проверками в коде.
 
-#### 100. Чем pessimistic locking отличается от optimistic locking?
+#### 106. Чем pessimistic locking отличается от optimistic locking?
 
 **Ожидаемый ответ:** pessimistic locking блокирует данные до изменения, предполагая высокий риск конфликта: `SELECT ... FOR UPDATE`. Optimistic locking не блокирует заранее, а проверяет версию при записи, предполагая, что конфликты редки.
 
@@ -1510,7 +1627,7 @@ func Contains[T comparable](xs []T, target T) bool {
 
 **Критерий выбора:** высокая конкуренция за одни и те же строки и строгие деньги/остатки - часто pessimistic или atomic update. Редактирование профиля/документа - часто optimistic version.
 
-#### 101. Что делает `SELECT ... FOR UPDATE`?
+#### 107. Что делает `SELECT ... FOR UPDATE`?
 
 **Ожидаемый ответ:** он читает строки и ставит row-level lock, запрещая другим транзакциям изменить или заблокировать эти строки несовместимым lock до commit/rollback текущей транзакции.
 
@@ -1518,7 +1635,7 @@ func Contains[T comparable](xs []T, target T) bool {
 
 **Практика:** для перевода денег блокируют оба счета в стабильном порядке, например по возрастанию id, чтобы снизить риск deadlock.
 
-#### 102. Что такое deadlock в БД и как его предотвращать?
+#### 108. Что такое deadlock в БД и как его предотвращать?
 
 **Ожидаемый ответ:** deadlock возникает, когда транзакции ждут locks друг друга по циклу. БД обычно обнаруживает deadlock, прерывает одну транзакцию, и приложение должно корректно обработать ошибку.
 
@@ -1526,7 +1643,7 @@ func Contains[T comparable](xs []T, target T) bool {
 
 **Сильный ответ:** кандидат говорит о retry только для безопасных транзакций и с ограничением попыток/backoff.
 
-#### 103. Почему нельзя делать внешние API-вызовы внутри DB-транзакции?
+#### 109. Почему нельзя делать внешние API-вызовы внутри DB-транзакции?
 
 **Ожидаемый ответ:** внешние вызовы непредсказуемы по latency и могут зависнуть. Пока транзакция открыта, она держит locks, connection из pool, snapshot/версионность и может блокировать другие операции.
 
@@ -1534,7 +1651,7 @@ func Contains[T comparable](xs []T, target T) bool {
 
 **Лучший подход:** сначала зафиксировать состояние и outbox event в транзакции, затем асинхронно вызвать внешний сервис. Для синхронных сценариев нужно очень явно понимать idempotency и компенсации.
 
-#### 104. Как правильно использовать `defer tx.Rollback()` в Go?
+#### 110. Как правильно использовать `defer tx.Rollback()` в Go?
 
 **Ожидаемый ответ:** после `BeginTx` часто делают `defer tx.Rollback()`. Если позже `Commit` успешен, deferred rollback вернет ошибку, которую обычно игнорируют. Это гарантирует rollback на любом early return до commit.
 
@@ -1542,7 +1659,7 @@ func Contains[T comparable](xs []T, target T) bool {
 
 **Пример паттерна:** begin, defer rollback, операции, commit, return. В сложном коде лучше иметь helper `WithTx(ctx, func(tx) error)`.
 
-#### 105. Как настроить connection pool в Go и какие симптомы неправильной настройки?
+#### 111. Как настроить connection pool в Go и какие симптомы неправильной настройки?
 
 **Ожидаемый ответ:** в `database/sql` важны `SetMaxOpenConns`, `SetMaxIdleConns`, `SetConnMaxLifetime`, `SetConnMaxIdleTime`. Слишком маленький pool вызывает ожидание connections и рост latency. Слишком большой pool перегружает БД и увеличивает contention.
 
@@ -1550,31 +1667,31 @@ func Contains[T comparable](xs []T, target T) bool {
 
 **Метрики:** open connections, in-use, idle, wait count, wait duration, query latency, DB CPU, locks. Middle+ должен связать latency приложения с ожиданием connection pool, а не только с медленными SQL.
 
-#### 106. Что такое prepared statements и parameterized queries?
+#### 112. Что такое prepared statements и parameterized queries?
 
 **Ожидаемый ответ:** parameterized query отделяет SQL-код от пользовательских значений, защищая от SQL injection и позволяя драйверу/БД безопасно передавать параметры. Prepared statement может быть предварительно разобран/спланирован и переиспользован.
 
 **Объяснение:** безопасность - главный аргумент. Performance зависит от БД, драйвера и plan caching. Нельзя подставлять user input через string concatenation, особенно в WHERE. Для dynamic identifiers используют allowlist, потому что параметры обычно не заменяют имена таблиц/колонок.
 
-#### 107. Что такое SQL injection в `ORDER BY` и как от нее защищаться?
+#### 113. Что такое SQL injection в `ORDER BY` и как от нее защищаться?
 
 **Ожидаемый ответ:** параметры безопасно подставляют значения, но не имена колонок или направление сортировки. Если пользователь передает `sort=created_at desc; drop table...`, конкатенация в `ORDER BY` опасна.
 
 **Защита:** allowlist: map внешних имен сортировки в заранее известные SQL expressions. Direction тоже allowlist `ASC/DESC`. Не принимать произвольный SQL-fragment от клиента.
 
-#### 108. Почему `SELECT *` часто плохая идея?
+#### 114. Почему `SELECT *` часто плохая идея?
 
 **Ожидаемый ответ:** `SELECT *` тянет лишние данные, увеличивает network IO, мешает index-only scans, делает код чувствительным к изменению схемы и может случайно начать читать тяжелые поля.
 
 **Объяснение:** явный список колонок - это контракт. Он упрощает review, снижает нагрузку и защищает от сюрпризов при добавлении новых колонок вроде JSON/blob.
 
-#### 109. Offset pagination: почему она деградирует?
+#### 115. Offset pagination: почему она деградирует?
 
 **Ожидаемый ответ:** при `OFFSET N LIMIT M` БД часто должна найти и пропустить N строк, поэтому большой offset становится дорогим. Кроме того, при новых вставках/удалениях между запросами пользователь может увидеть дубли или пропуски.
 
 **Лучшее решение:** keyset/cursor pagination по стабильному порядку, например `(created_at, id)`. Cursor хранит последнее значение сортировки и id, следующий запрос делает `WHERE (created_at, id) < ($lastCreatedAt, $lastID)`.
 
-#### 110. Как проектировать cursor pagination правильно?
+#### 116. Как проектировать cursor pagination правильно?
 
 **Ожидаемый ответ:** нужен детерминированный порядок, уникальный tie-breaker, непрозрачный cursor, стабильные фильтры, направление сортировки, обработка deleted/inserted rows. Cursor обычно кодирует значения sort keys, а не номер страницы.
 
@@ -1582,7 +1699,7 @@ func Contains[T comparable](xs []T, target T) bool {
 
 **Сильный ответ:** кандидат учитывает безопасность cursor: не доверять ему слепо, подписывать или валидировать, не раскрывать лишние данные.
 
-#### 111. Как безопасно делать schema migration на большой таблице?
+#### 117. Как безопасно делать schema migration на большой таблице?
 
 **Ожидаемый ответ:** избегать долгих exclusive locks. Делать изменения маленькими шагами: добавить nullable column без тяжелого default, задеплоить код с dual write/read fallback, backfill батчами с throttling, добавить constraint/index concurrently, переключить чтение, затем удалить старую колонку отдельным шагом.
 
@@ -1590,19 +1707,19 @@ func Contains[T comparable](xs []T, target T) bool {
 
 **Сильный ответ:** кандидат спрашивает про конкретную БД и версию, потому что поведение DDL отличается между PostgreSQL/MySQL.
 
-#### 112. Как добавлять `NOT NULL` колонку с default на большой таблице?
+#### 118. Как добавлять `NOT NULL` колонку с default на большой таблице?
 
 **Ожидаемый ответ:** зависит от БД и версии. Безопасный общий подход: добавить nullable column, начать писать значение из приложения, backfill старыми строками батчами, добавить constraint/validate, затем сделать колонку NOT NULL.
 
 **Объяснение:** в некоторых версиях БД добавление column with default может переписать всю таблицу или взять тяжелый lock. Даже если современная версия оптимизирует fast default, нужно проверить поведение.
 
-#### 113. Что такое online index creation?
+#### 119. Что такое online index creation?
 
 **Ожидаемый ответ:** создание индекса без длительной блокировки записей. В PostgreSQL это `CREATE INDEX CONCURRENTLY`, в MySQL - online DDL в зависимости от engine/version. Оно обычно дольше и имеет ограничения, но снижает downtime.
 
 **Объяснение:** обычный `CREATE INDEX` может блокировать writes. Concurrent index build снижает impact, но все равно создает нагрузку на IO/CPU и может усилить replication lag.
 
-#### 114. Что такое replication lag и чем он опасен?
+#### 120. Что такое replication lag и чем он опасен?
 
 **Ожидаемый ответ:** replication lag - задержка между primary и replica. Опасность: приложение читает с replica и не видит только что записанные данные, пользователь получает stale read, фоновые процессы принимают решения на старых данных.
 
@@ -1610,55 +1727,55 @@ func Contains[T comparable](xs []T, target T) bool {
 
 **Решения:** читать критичные read-after-write запросы с primary, sticky reads на время, отслеживать lag, использовать causal consistency tokens, проектировать UI/flow с eventual consistency.
 
-#### 115. Когда читать с replica, а когда с primary?
+#### 121. Когда читать с replica, а когда с primary?
 
 **Ожидаемый ответ:** replica подходит для read-heavy аналитических/некритичных запросов, где stale data допустима. Primary нужен для транзакционных reads, read-after-write, проверок инвариантов, authorization/permissions, финансовых операций.
 
 **Сильный ответ:** кандидат не переносит все чтения на replica ради "масштабирования", а классифицирует запросы по требованиям консистентности.
 
-#### 116. Что такое read/write splitting и какие у него ловушки?
+#### 122. Что такое read/write splitting и какие у него ловушки?
 
 **Ожидаемый ответ:** read/write splitting направляет writes на primary, reads на replicas. Ловушки: replication lag, транзакции, read-after-write, разные планы/статистика на replica, failover, сложность отладки.
 
 **Практика:** слой доступа к данным должен явно уметь выбирать consistency level, а не случайно отправлять любой SELECT на replica.
 
-#### 117. Что такое sharding и когда он нужен?
+#### 123. Что такое sharding и когда он нужен?
 
 **Ожидаемый ответ:** sharding - горизонтальное разделение данных по shard key между несколькими БД/кластерами. Он нужен, когда один кластер уже не справляется по объему, throughput, storage, tenant isolation или operational limits.
 
 **Объяснение:** sharding резко повышает сложность: cross-shard queries, transactions, rebalancing, hot shards, migrations, operational tooling. До sharding обычно стоит оптимизировать схему, индексы, queries, caching, partitioning, read replicas.
 
-#### 118. Как выбрать shard key?
+#### 124. Как выбрать shard key?
 
 **Ожидаемый ответ:** shard key должен равномерно распределять нагрузку, соответствовать частым access patterns, минимизировать cross-shard operations и позволять growth/rebalancing. Часто это tenant_id/user_id, но нужно учитывать hot tenants.
 
 **Риск:** timestamp как shard key может создать hot shard. Слишком мелкий random key может разрушить locality и усложнить запросы по tenant.
 
-#### 119. Чем partitioning отличается от sharding?
+#### 125. Чем partitioning отличается от sharding?
 
 **Ожидаемый ответ:** partitioning делит таблицу внутри одной логической БД/кластера на partitions, обычно прозрачно для приложения. Sharding делит данные между независимыми БД/кластерами, часто требует routing на уровне приложения/инфраструктуры.
 
 **Объяснение:** partitioning помогает с управлением большими таблицами, pruning, retention, индексами по частям. Но он не убирает все ограничения одного кластера и не всегда увеличивает write capacity линейно.
 
-#### 120. Когда полезно partitioning по времени?
+#### 126. Когда полезно partitioning по времени?
 
 **Ожидаемый ответ:** для event/log/audit/time-series таблиц, где большинство запросов ограничено периодом, а старые данные нужно архивировать или удалять. Можно быстро drop old partition вместо массового delete.
 
 **Риск:** если запросы не фильтруют по partition key, pruning не сработает и придется сканировать много partitions. Слишком много partitions тоже ухудшает planning/maintenance.
 
-#### 121. Как проектировать soft delete?
+#### 127. Как проектировать soft delete?
 
 **Ожидаемый ответ:** soft delete обычно добавляет `deleted_at` или status. Нужно решить, участвуют ли удаленные записи в unique constraints, запросах, audit, восстановлении и retention. Часто нужны partial unique indexes, например уникальный email только для `deleted_at IS NULL`.
 
 **Объяснение:** soft delete усложняет каждый запрос: нужно не забывать фильтр. Ошибка может показать удаленные данные пользователю. Иногда лучше hard delete + audit/archive, в зависимости от домена и требований.
 
-#### 122. Как хранить audit log?
+#### 128. Как хранить audit log?
 
 **Ожидаемый ответ:** audit log должен быть append-only, содержать actor, action, target, timestamp, correlation/request id, before/after или diff, source/service, metadata. Для критичных изменений audit пишется в той же транзакции, что и бизнес-изменение.
 
 **Объяснение:** audit нужен для расследований и compliance, поэтому он должен быть надежным и защищенным от тихого изменения. Но нельзя бездумно писать PII/secrets; нужны retention и access control.
 
-#### 123. Что такое outbox pattern и почему он связан с БД?
+#### 129. Что такое outbox pattern и почему он связан с БД?
 
 **Ожидаемый ответ:** outbox pattern решает проблему атомарности между записью в БД и публикацией сообщения. В одной транзакции с бизнес-изменением приложение записывает outbox row. Отдельный publisher читает outbox и публикует в брокер, затем помечает как отправленное.
 
@@ -1666,13 +1783,13 @@ func Contains[T comparable](xs []T, target T) bool {
 
 **Сильный ответ:** consumers все равно должны быть idempotent, потому что publisher может отправить событие повторно.
 
-#### 124. Что такое inbox/idempotent consumer pattern?
+#### 130. Что такое inbox/idempotent consumer pattern?
 
 **Ожидаемый ответ:** consumer сохраняет id обработанного сообщения или idempotency key в БД с unique constraint. При повторной доставке он видит, что сообщение уже обработано, и не выполняет side effect повторно.
 
 **Объяснение:** брокеры часто дают at-least-once delivery. Это значит, что дубли - нормальное поведение, а не исключение. Идемпотентность consumer-а защищает от повторных списаний, повторных email и дублирующих записей.
 
-#### 125. Как проектировать уникальность с учетом race conditions?
+#### 131. Как проектировать уникальность с учетом race conditions?
 
 **Ожидаемый ответ:** уникальность должна быть закреплена unique constraint/index в БД. Проверка "сначала SELECT, потом INSERT" без constraint не защищает от гонки.
 
@@ -1680,109 +1797,109 @@ func Contains[T comparable](xs []T, target T) bool {
 
 **Практика:** application-level pre-check может улучшить UX, но source of truth - constraint. Ошибку unique violation нужно мапить в доменную ошибку.
 
-#### 126. Как хранить деньги и decimal-значения?
+#### 132. Как хранить деньги и decimal-значения?
 
 **Ожидаемый ответ:** не использовать float для денег из-за ошибок бинарного представления и округления. Использовать integer minor units (`cents`) или decimal/numeric тип с явными правилами precision/scale.
 
 **Объяснение:** финансовые операции требуют детерминированного округления и точности. В Go можно использовать int64 minor units или decimal library, но важно не смешивать валюты и хранить currency code.
 
-#### 127. Как моделировать many-to-many связь?
+#### 133. Как моделировать many-to-many связь?
 
 **Ожидаемый ответ:** через join table с foreign keys, например `user_roles(user_id, role_id)`, unique constraint на пару, индексы под оба направления запросов. Если у связи есть атрибуты, join table становится полноценной сущностью.
 
 **Объяснение:** array/json со списком ids может казаться проще, но ломает referential integrity, усложняет запросы, индексы и каскадные изменения.
 
-#### 128. Когда JSON/JSONB в реляционной БД - хорошая идея, а когда плохая?
+#### 134. Когда JSON/JSONB в реляционной БД - хорошая идея, а когда плохая?
 
 **Ожидаемый ответ:** JSONB полезен для редких, гибких, слабо структурированных attributes, metadata, внешних payloads, когда не все поля участвуют в строгих связях. Плохая идея хранить в JSON ключевые доменные поля, по которым нужны constraints, joins, частые фильтры и аналитика.
 
 **Объяснение:** JSONB снижает миграционную стоимость, но переносит часть схемы в приложение. Это может ухудшить качество данных и усложнить индексацию.
 
-#### 129. ORM vs raw SQL: какие trade-off?
+#### 135. ORM vs raw SQL: какие trade-off?
 
 **Ожидаемый ответ:** ORM ускоряет типовые CRUD, mapping и миграцию моделей, но может скрывать SQL, создавать N+1, сложные неэффективные запросы и привязывать доменную модель к persistence. Raw SQL прозрачен и оптимизируем, но требует больше boilerplate.
 
 **Сильный ответ:** выбор не религиозный. Для сложных запросов и performance-critical paths часто лучше явный SQL, для простых CRUD может быть ORM/query builder. Важно логировать SQL и тестировать реальные queries.
 
-#### 130. Как диагностировать медленный endpoint: БД или приложение?
+#### 136. Как диагностировать медленный endpoint: БД или приложение?
 
 **Ожидаемый ответ:** смотреть distributed tracing или хотя бы latency breakdown: время handler-а, время SQL, ожидание connection pool, внешние API, serialization. В БД смотреть slow query log, `EXPLAIN ANALYZE`, locks, CPU/IO, cache hit ratio.
 
 **Объяснение:** endpoint может быть медленным не из-за самого SQL, а из-за ожидания свободного connection, lock wait, N+1 queries, большого JSON response, GC pressure или внешнего API.
 
-#### 131. Что такое lock wait и как его увидеть?
+#### 137. Что такое lock wait и как его увидеть?
 
 **Ожидаемый ответ:** lock wait - время ожидания блокировки, которую держит другая транзакция. Его можно увидеть через системные views БД, slow query logs, wait events, monitoring. В PostgreSQL смотрят `pg_stat_activity`, `pg_locks`, wait_event.
 
 **Объяснение:** запрос может быть простым по плану, но висеть из-за блокировки. Поэтому одного `EXPLAIN` недостаточно для live-инцидента; нужно смотреть активные транзакции и locks.
 
-#### 132. Почему долгие транзакции опасны даже без активной работы?
+#### 138. Почему долгие транзакции опасны даже без активной работы?
 
 **Ожидаемый ответ:** долгая транзакция держит snapshot, может удерживать locks, мешать vacuum/cleanup старых версий строк, увеличивать bloat, занимать connection и блокировать schema changes.
 
 **Объяснение:** в MVCC БД старые версии строк нельзя очистить, пока они потенциально видимы открытой транзакции. Поэтому "idle in transaction" - серьезная production-проблема.
 
-#### 133. Что такое MVCC?
+#### 139. Что такое MVCC?
 
 **Ожидаемый ответ:** Multi-Version Concurrency Control позволяет транзакциям видеть согласованный snapshot данных, пока другие транзакции пишут новые версии строк. Читатели и писатели меньше блокируют друг друга, но появляются старые версии, vacuum/cleanup и особенности изоляции.
 
 **Объяснение:** MVCC объясняет, почему read committed видит новые committed данные между statement-ами, почему долгие транзакции мешают cleanup, и почему update фактически создает новую версию строки.
 
-#### 134. Что такое vacuum/bloat в PostgreSQL?
+#### 140. Что такое vacuum/bloat в PostgreSQL?
 
 **Ожидаемый ответ:** update/delete создают dead tuples. Vacuum очищает их, когда они больше не видимы активным транзакциям. Bloat - разрастание таблиц/индексов из-за накопления неиспользуемого пространства.
 
 **Объяснение:** если autovacuum не успевает или долгие транзакции удерживают старые версии, таблица растет, запросы читают больше страниц, cache хуже работает. Это влияет на latency и storage.
 
-#### 135. Как проектировать retention и удаление большого объема данных?
+#### 141. Как проектировать retention и удаление большого объема данных?
 
 **Ожидаемый ответ:** не удалять миллионы строк одним большим `DELETE` в рабочее время. Использовать partitioning и drop partition, batch deletes с лимитами, throttling, архивирование, monitoring replication lag/WAL/locks.
 
 **Объяснение:** массовое удаление создает locks, WAL, bloat, нагрузку на replica и vacuum. Для time-series данных partition drop часто намного безопаснее.
 
-#### 136. Что такое cache-aside и какие риски у кеширования данных из БД?
+#### 142. Что такое cache-aside и какие риски у кеширования данных из БД?
 
 **Ожидаемый ответ:** cache-aside: приложение сначала читает cache, при miss читает БД и кладет значение в cache. Риски: stale data, cache stampede, invalidation complexity, inconsistent serialization, hot keys.
 
 **Объяснение:** cache не исправляет плохую модель данных автоматически. Он добавляет consistency trade-off. Нужны TTL, jitter, singleflight/request coalescing, invalidation strategy и metrics hit rate.
 
-#### 137. Что такое cache stampede?
+#### 143. Что такое cache stampede?
 
 **Ожидаемый ответ:** cache stampede возникает, когда популярный ключ истекает, и много запросов одновременно идут в БД пересчитывать одно значение.
 
 **Решения:** TTL jitter, early refresh, singleflight/locking, stale-while-revalidate, background refresh, request collapsing. Для критичных hot keys можно прогревать cache заранее.
 
-#### 138. Как выбрать между нормализацией и денормализацией?
+#### 144. Как выбрать между нормализацией и денормализацией?
 
 **Ожидаемый ответ:** нормализация снижает дублирование и аномалии записи, улучшает целостность. Денормализация ускоряет чтение и упрощает read models, но создает риск рассинхронизации и усложняет write path.
 
 **Объяснение:** правильный выбор зависит от read/write ratio, требований консистентности и сложности запросов. Часто базовая transactional model нормализована, а денормализованные read models строятся асинхронно.
 
-#### 139. Что такое referential integrity и когда нужны foreign keys?
+#### 145. Что такое referential integrity и когда нужны foreign keys?
 
 **Ожидаемый ответ:** foreign keys гарантируют, что ссылка указывает на существующую запись, и задают поведение при delete/update. Они защищают качество данных на уровне БД.
 
 **Trade-off:** FK добавляют проверки и могут усложнять bulk loads/sharding, но отказ от FK требует надежной компенсации в приложении и monitoring orphan records. Для большинства обычных OLTP-систем FK полезны.
 
-#### 140. Что такое `ON DELETE CASCADE` и какие риски?
+#### 146. Что такое `ON DELETE CASCADE` и какие риски?
 
 **Ожидаемый ответ:** `ON DELETE CASCADE` автоматически удаляет дочерние строки при удалении родителя. Риск - случайное удаление большого дерева данных, долгие locks, неожиданная потеря audit/history.
 
 **Практика:** использовать осознанно, ограничивать права, иметь soft delete/audit там, где данные критичны, и понимать размер каскада.
 
-#### 141. Как хранить и проверять права доступа в БД-запросах?
+#### 147. Как хранить и проверять права доступа в БД-запросах?
 
 **Ожидаемый ответ:** права лучше учитывать прямо в запросах через tenant_id/user_id/ACL joins, чтобы не загрузить лишние данные и не отфильтровывать их только в памяти. В multi-tenant системе почти все таблицы должны иметь tenant boundary, если нет отдельной физической изоляции.
 
 **Объяснение:** фильтрация доступа после чтения может привести к утечке данных через баг, logs, cache или side channel. DB-level Row Level Security может помочь, но тоже требует дисциплины и тестов.
 
-#### 142. Какие вопросы задать кандидату по реальному инциденту с БД?
+#### 148. Какие вопросы задать кандидату по реальному инциденту с БД?
 
 **Ожидаемый ответ:** попросить описать симптомы, метрики, запросы, locks, connection pool, изменения перед инцидентом, mitigation и postmortem. Сильный кандидат говорит о slow query, bad migration, missing index, lock contention, replication lag, pool exhaustion или vacuum/bloat с конкретным расследованием.
 
 **Что слушать:** не только "добавили индекс", а как убедились, что причина именно в этом; как безопасно применяли fix; какие alerts/tests/runbooks добавили после.
 
-#### 143. Практический кейс: endpoint `GET /orders` стал медленным после роста данных. Как расследовать?
+#### 149. Практический кейс: endpoint `GET /orders` стал медленным после роста данных. Как расследовать?
 
 **Ожидаемый ответ:** начать с воспроизведения и метрик: latency percentiles, RPS, error rate, DB time, number of queries per request. Проверить N+1, slow query log, `EXPLAIN ANALYZE`, наличие индексов под filters/sort, offset pagination, размер response, connection pool wait.
 
@@ -1790,13 +1907,13 @@ func Contains[T comparable](xs []T, target T) bool {
 
 **Хорошее решение:** добавить/исправить composite или partial index, перейти на cursor pagination, batch-load related data, ограничить page size, добавить metrics и regression test/benchmark для query plan.
 
-#### 144. Практический кейс: иногда создание пользователя возвращает 500 вместо "email занят". Что проверить?
+#### 150. Практический кейс: иногда создание пользователя возвращает 500 вместо "email занят". Что проверить?
 
 **Ожидаемый ответ:** проверить unique constraint на email, обработку unique violation в Go, race между pre-check и insert, нормализацию email, collation/case sensitivity, transaction boundaries.
 
 **Объяснение:** корректная схема: нормализовать email или использовать case-insensitive type/index, иметь unique constraint, при конфликте мапить DB error в доменную `ErrEmailAlreadyExists` и HTTP 409. Предварительный SELECT не заменяет constraint.
 
-#### 145. Практический кейс: воркеры периодически берут одну и ту же job дважды. Как исправить?
+#### 151. Практический кейс: воркеры периодически берут одну и ту же job дважды. Как исправить?
 
 **Ожидаемый ответ:** использовать атомарное claim-обновление или locking pattern: `SELECT ... FOR UPDATE SKIP LOCKED` внутри транзакции, затем update status; либо `UPDATE ... WHERE status='pending' ... RETURNING`. Нужны lease/visibility timeout для recovery после падения worker-а.
 
@@ -1804,19 +1921,19 @@ func Contains[T comparable](xs []T, target T) bool {
 
 **Сильный ответ:** кандидат учитывает idempotency обработки job, retry count, next_run_at, dead-letter status и мониторинг queue lag.
 
-#### 146. Практический кейс: после релиза выросло число DB connections. Что делать?
+#### 152. Практический кейс: после релиза выросло число DB connections. Что делать?
 
 **Ожидаемый ответ:** проверить настройки pool в сервисе, количество pod-ов, утечки rows (`rows.Close()`), долгие транзакции, новые background workers, retry loops, health checks, connection lifetime. Сравнить DB max connections и суммарный потенциальный pool всех инстансов.
 
 **Объяснение:** в Go `database/sql` lazy-open, но при нагрузке может открыть до `MaxOpenConns` на каждый процесс. Если лимит не задан, поведение может перегрузить БД.
 
-#### 147. Практический кейс: миграция зависла и заблокировала записи. Как действовать?
+#### 153. Практический кейс: миграция зависла и заблокировала записи. Как действовать?
 
 **Ожидаемый ответ:** сначала стабилизировать: понять blocking query/lock, оценить impact, при необходимости cancel/terminate migration, откатить deploy или отключить traffic. Потом разобрать DDL, lock level, размер таблицы, наличие long transactions.
 
 **Профилактика:** lock timeout для миграций, statement timeout, online/concurrent operations, dry run на staging с похожим объемом, миграции маленькими шагами, мониторинг locks и replication lag.
 
-#### 148. Какие DB-вопросы стоит считать обязательными для Middle+ Go backend?
+#### 154. Какие DB-вопросы стоит считать обязательными для Middle+ Go backend?
 
 **Ожидаемый ответ:** транзакции и rollback/commit, базовые индексы и `EXPLAIN`, N+1, connection pool, уникальность через constraints, migration safety, isolation/lost update, context timeouts для SQL, обработка DB errors.
 
